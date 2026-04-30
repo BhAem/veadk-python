@@ -87,8 +87,6 @@ class Agent(LlmAgent):
         example_store (Optional[BaseExampleProvider]): Example store for providing example Q/A.
         enable_shadowchar (bool): Whether to enable shadow character for the agent.
         enable_dynamic_load_skills (bool): Whether to enable dynamic loading of skills.
-        enable_responses_cache (bool): Whether Ark Responses API should reuse
-            `previous_response_id` and caching for multi-turn continuation.
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
@@ -120,7 +118,6 @@ class Agent(LlmAgent):
     tracers: list[BaseTracer] = []
 
     enable_responses: bool = False
-    enable_responses_cache: bool = True
 
     context_cache_config: Optional[ContextCacheConfig] = None
 
@@ -197,7 +194,6 @@ class Agent(LlmAgent):
                     model=f"{self.model_provider}/{self.model_name}",
                     api_key=self.model_api_key,
                     api_base=self.model_api_base,
-                    enable_responses_cache=self.enable_responses_cache,
                     **self.model_extra_config,
                 )
             else:
@@ -384,7 +380,6 @@ class Agent(LlmAgent):
 
         self.skills_dict: Dict[str, Skill] = {}
 
-        # Determine skills_mode if not set
         if not self.skills_mode:
             tool_id = os.getenv("AGENTKIT_TOOL_ID")
             if not tool_id:
@@ -451,6 +446,19 @@ class Agent(LlmAgent):
                     )
             logger.info(f"Determined skills_mode: {self.skills_mode}")
 
+        all_local = True
+        for item in self.skills:
+            if not item or str(item).strip() == "":
+                continue
+            path = Path(item)
+            if not (path.exists() and path.is_dir()):
+                all_local = False
+                break
+
+        if all_local:
+            self._load_local_skills_with_adk()
+            return
+
         for item in self.skills:
             if not item or str(item).strip() == "":
                 continue
@@ -515,6 +523,79 @@ class Agent(LlmAgent):
                     ]
             else:
                 self.before_agent_callback = check_skills
+
+    def _load_local_skills_with_adk(self):
+        from pathlib import Path
+
+        from google.adk.skills import load_skill_from_dir
+        from google.adk.tools import FunctionTool, skill_toolset
+        from google.adk.code_executors.unsafe_local_code_executor import (
+            UnsafeLocalCodeExecutor,
+        )
+
+        from veadk.skills.skill import Skill
+        from veadk.skills.utils import update_check_list
+        from veadk.tools.skills_tools.register_skills_tool import register_skills_tool
+
+        adk_skills = []
+        veadk_skills_dict: Dict[str, Skill] = {}
+
+        for item in self.skills:
+            if not item or str(item).strip() == "":
+                continue
+            path = Path(item)
+            if path.exists() and path.is_dir():
+                for skill_dir in path.iterdir():
+                    if skill_dir.is_dir():
+                        try:
+                            adk_skill = load_skill_from_dir(skill_dir)
+                            adk_skills.append(adk_skill)
+                            checklist = getattr(adk_skill.frontmatter, "checklist", [])
+                            if (
+                                not checklist
+                                and "checklist" in adk_skill.frontmatter.model_extra
+                            ):
+                                checklist = adk_skill.frontmatter.model_extra[
+                                    "checklist"
+                                ]
+                            veadk_skills_dict[adk_skill.name] = Skill(
+                                name=adk_skill.name,
+                                description=adk_skill.description,
+                                path=str(skill_dir),
+                                checklist=checklist,
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to load skill from {skill_dir} with Google ADK loader: {e}. Skipping."
+                            )
+
+        if not adk_skills:
+            logger.warning("No skills loaded from local directories.")
+            return
+
+        self.skills_dict = veadk_skills_dict
+        self._skills_with_checklist = veadk_skills_dict
+
+        has_checklist = any(skill.checklist for skill in veadk_skills_dict.values())
+
+        if has_checklist:
+            self.instruction += (
+                "Some skills have a checklist that you must complete step by step. "
+                "Use the `update_check_list` tool to mark each item as completed.\n\n"
+            )
+
+        adk_skill_toolset = skill_toolset.SkillToolset(
+            skills=adk_skills, code_executor=UnsafeLocalCodeExecutor()
+        )
+        self.tools.append(adk_skill_toolset)
+
+        self.tools.append(FunctionTool(register_skills_tool))
+        self.tools.append(FunctionTool(update_check_list))
+
+        logger.info(
+            f"Loaded {len(adk_skills)} local skills using Google ADK SkillToolset: "
+            f"{[s.name for s in adk_skills]}"
+        )
 
     def _validate_tool_dependencies(self):
         tool_names = set()
